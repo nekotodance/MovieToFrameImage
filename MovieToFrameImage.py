@@ -9,7 +9,21 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import QLabel, QMainWindow, QApplication, QSizePolicy
 
-TITLENAME = "MovieToFrameImage 0.1.0"
+import pvsubfunc
+
+DEF_SOUND_OK = "ok.wav"
+DEF_SOUND_NG = "ng.wav"
+APP_WIDTH = 320
+APP_HEIGHT = 320
+
+WINDOW_TITLE = "MovieToFrameImage 0.1.1"
+SETTINGS_FILE = "MovieToFrameImage.json"
+GEOMETRY_X = "geometry-x"
+GEOMETRY_Y = "geometry-y"
+GEOMETRY_W = "geometry-w"
+GEOMETRY_H = "geometry-h"
+SOUND_FILE_OK = "sound-file-ok"
+SOUND_FILE_NG = "sound-file-ng"
 
 # -------------------------------
 # フレーム読み込みスレッド
@@ -80,7 +94,6 @@ class FrameLoader(QThread):
         except Exception as e:
             self.error.emit(str(e))
 
-
 # -------------------------------
 # メインウインドウ
 # -------------------------------
@@ -88,7 +101,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle(TITLENAME)
+        self.setWindowTitle(WINDOW_TITLE)
+        self.setGeometry(100, 100, APP_WIDTH, APP_HEIGHT)
         self.setAcceptDrops(True)
 
         # 状態管理
@@ -100,6 +114,13 @@ class MainWindow(QMainWindow):
         self.current_frame = 0
         self.playing = False
 
+        self.pydir = os.path.dirname(os.path.abspath(__file__))
+        self.soundOK = DEF_SOUND_OK
+        self.soundNG = DEF_SOUND_NG
+        #設定ファイルがあれば読み込み
+        if os.path.exists(SETTINGS_FILE):
+            self.load_settings()
+
         # タイマー
         self.timer = QtCore.QTimer()
         self.timer.timeout.connect(self.next_frame)
@@ -108,7 +129,7 @@ class MainWindow(QMainWindow):
         self.label = QLabel()
         self.label.setAlignment(Qt.AlignCenter)
         self.label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.label.setMinimumSize(256, 256)
+        self.label.setMinimumSize(APP_WIDTH, APP_HEIGHT)
 
         self.info_label = QLabel("動画ファイルかディレクトリをドロップしてください")
         self.info_label.setAlignment(Qt.AlignLeft)
@@ -223,6 +244,18 @@ class MainWindow(QMainWindow):
         self.timer.start(int(dur))
 
     # --------------------------------
+    # イベント処理
+    # --------------------------------
+    # ウインドウサイズ変更
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.update_frame()
+    # 終了時
+    def closeEvent(self, event):
+        self.save_settings()
+        super().closeEvent(event)
+
+    # --------------------------------
     # 入力処理
     # --------------------------------
     # キーボード
@@ -232,36 +265,43 @@ class MainWindow(QMainWindow):
         # スペース：再生/停止
         if key == Qt.Key_Space:
             self.toggle_play()
-        # 左
+        # 左、A：次のフレーム
         elif key in (Qt.Key_Left, Qt.Key_A):
             self.prev_frame()
-        # 右
+        # 右、D：前のフレーム
         elif key in (Qt.Key_Right, Qt.Key_D):
             self.next_frame_manual()
-        # , < / Back
+        # , Q：次の動画
         elif key in (Qt.Key_Comma, Qt.Key_Q):
             self.prev_movie()
-        # . > / Forward
+        # . E：前の動画
         elif key in (Qt.Key_Period, Qt.Key_E):
             self.next_movie()
-        # 上：保存
+        # 上 W：保存
         elif key in (Qt.Key_Up, Qt.Key_W):
             self.save_frame()
-        # F フィット表示
+        # F：フィット表示（動画サイズにウインドウを合わせる）
         elif key == Qt.Key_F:
-            # 実寸サイズにウインドウを合わせる
-            if self.frames:
-                fr = self.frames[self.current_frame]
-                h, w, _ = fr.shape
-                self.resize(w, h + 40)
-            self.update_frame()
+            self.fit_window()
 
     # マウスボタン
     def mousePressEvent(self, e):
+        test = e.button()
+        # 左：再生/停止
         if e.button() == Qt.LeftButton:
             self.toggle_play()
+        # 右：保存
         elif e.button() == Qt.RightButton:
             self.save_frame()
+        # 戻る：Back
+        elif e.button() == Qt.XButton1:
+            self.prev_movie()
+        # 進む：Forward
+        elif e.button() == Qt.XButton2:
+            self.next_movie()
+        # 中：フィット表示（動画サイズにウインドウを合わせる）
+        elif e.button() == Qt.MiddleButton:
+            self.fit_window()
 
     # マウスホイール
     def wheelEvent(self, e):
@@ -321,10 +361,19 @@ class MainWindow(QMainWindow):
             self.current_index -= 1
             self.load_current()
 
-    # ウインドウサイズ変更
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
+    # フィット表示（実寸サイズにウインドウを合わせる）
+    def fit_window(self):
+        if self.frames:
+            fr = self.frames[self.current_frame]
+            h, w, _ = fr.shape
+            self.resize(w, h + 40)
         self.update_frame()
+
+    # サウンド再生
+    def play_wave(self, file_name):
+        if not file_name: return
+        file_path = f"{self.pydir}/{file_name}"
+        pvsubfunc.play_wave(file_path)
 
     # --------------------------------
     # 保存
@@ -332,17 +381,46 @@ class MainWindow(QMainWindow):
     def save_frame(self):
         if not self.frames:
             return
-        srcfname = self.playlist[self.current_index]
-        path = os.path.dirname(srcfname)
-        base = os.path.splitext(os.path.basename(srcfname))[0]
-        # シーク動作にあわせてframe番号を1オリジンに変更
-        fname = f"{base}_frm{self.current_frame + 1:04d}.png"
-        fullfname = os.path.join(path, fname)
-        fr = self.frames[self.current_frame]
-        img = Image.fromarray(fr)
-        img.save(fullfname)
+        fullfname = "no file"
+        try:
+            srcfname = self.playlist[self.current_index]
+            path = os.path.dirname(srcfname)
+            base = os.path.splitext(os.path.basename(srcfname))[0]
+            # シーク動作にあわせてframe番号を1オリジンに変更
+            fname = f"{base}_frm{self.current_frame + 1:04d}.png"
+            fullfname = os.path.join(path, fname)
+            fr = self.frames[self.current_frame]
+            img = Image.fromarray(fr)
+            img.save(fullfname)
 
-        self.info_label.setText(f"Saved: {fullfname}")
+            self.play_wave(self.soundOK)
+            self.info_label.setText(f"Saved: {fullfname}")
+        except Exception as e:
+            self.play_wave(self.soundNG)
+            self.info_label.setText(f"error: {fullfname}")
+
+    # --------------------------------
+    # 設定データ
+    # --------------------------------
+    def load_settings(self):
+        geox = pvsubfunc.read_value_from_config(SETTINGS_FILE, GEOMETRY_X)
+        geoy = pvsubfunc.read_value_from_config(SETTINGS_FILE, GEOMETRY_Y)
+        geow = pvsubfunc.read_value_from_config(SETTINGS_FILE, GEOMETRY_W)
+        geoh = pvsubfunc.read_value_from_config(SETTINGS_FILE, GEOMETRY_H)
+        if not any(val is None for val in [geox, geoy, geow, geoh]):
+            self.setGeometry(geox, geoy, geow, geoh)
+
+        self.soundOK = pvsubfunc.read_value_from_config(SETTINGS_FILE, SOUND_FILE_OK, DEF_SOUND_OK)
+        self.soundNG = pvsubfunc.read_value_from_config(SETTINGS_FILE, SOUND_FILE_NG, DEF_SOUND_NG)
+
+    def save_settings(self):
+        pvsubfunc.write_value_to_config(SETTINGS_FILE, GEOMETRY_X, self.geometry().x())
+        pvsubfunc.write_value_to_config(SETTINGS_FILE, GEOMETRY_Y, self.geometry().y())
+        pvsubfunc.write_value_to_config(SETTINGS_FILE, GEOMETRY_W, self.geometry().width())
+        pvsubfunc.write_value_to_config(SETTINGS_FILE, GEOMETRY_H, self.geometry().height())
+
+        pvsubfunc.write_value_to_config(SETTINGS_FILE, SOUND_FILE_OK, self.soundOK)
+        pvsubfunc.write_value_to_config(SETTINGS_FILE, SOUND_FILE_NG, self.soundNG)
 
 # ---------------------------------------------------------
 # 起動
@@ -350,6 +428,5 @@ class MainWindow(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     w = MainWindow()
-    w.resize(800, 600)
     w.show()
     sys.exit(app.exec_())
