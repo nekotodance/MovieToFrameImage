@@ -1,12 +1,11 @@
-import sys
-import os
+import sys, os, gc
 import numpy as np
 import imageio.v2 as imageio
 from PIL import Image
 
 from PyQt5 import QtGui, QtCore, QtWidgets
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtGui import QImage, QPixmap, QColor, QPainter, QFont, QFontMetrics
 from PyQt5.QtWidgets import QLabel, QMainWindow, QApplication, QSizePolicy
 
 import pvsubfunc
@@ -16,7 +15,7 @@ DEF_SOUND_NG = "ng.wav"
 APP_WIDTH = 320
 APP_HEIGHT = 320
 
-WINDOW_TITLE = "MovieToFrameImage 0.1.1"
+WINDOW_TITLE = "MovieToFrameImage 0.1.2"
 SETTINGS_FILE = "MovieToFrameImage.json"
 GEOMETRY_X = "geometry-x"
 GEOMETRY_Y = "geometry-y"
@@ -29,70 +28,62 @@ SOUND_FILE_NG = "sound-file-ng"
 # フレーム読み込みスレッド
 # -------------------------------
 class FrameLoader(QThread):
-    progress = pyqtSignal(int)        # 現在フレーム数
-    finished = pyqtSignal(list, float, list)  # frames, fps, durations
+    progress = pyqtSignal(list, int, int, float)    # frames, 現在フレーム数, 総フレーム数, fps
+    finished = pyqtSignal(list)                     # frames
     error = pyqtSignal(str)
 
     def __init__(self, path):
         super().__init__()
         self.path = path
-
+        self._is_running = True
     def run(self):
+        total_frames = 0
         try:
             ext = os.path.splitext(self.path)[1].lower()
+            frames = []
+            idx = 0
+            framerate = 0.0
 
-            if ext == ".mp4":
-                reader = imageio.get_reader(self.path)
-                fps = reader.get_meta_data().get("fps", 30.0)
-                frames = []
-                durations = []
-
-                for idx, fr in enumerate(reader):
-                    frames.append(fr)
-                    durations.append(1.0 / fps)
-                    self.progress.emit(idx + 1)
-
-                reader.close()
-
-                self.finished.emit(frames, fps, durations)
-                return
-
-            elif ext == ".webp":
+            if ext == ".webp":
                 img = Image.open(self.path)
-                frames = []
-                durations = []
-                idx = 0
-
-                while True:
+                total_frames = img.n_frames
+                # 本来webpはフレームごとのウェイト（可変フレームレート）に対応しているが、
+                # このソフトでは固定フレームレート（先頭フレームの表示時間から算出）として処理する（手抜き）
+                dur_ms = img.info.get("duration", 66)
+                framerate = 1.0 / (dur_ms / 1000.0)
+                while self._is_running:
                     frame = np.array(img.convert("RGB"))
                     frames.append(frame)
-
-                    # 1フレームの ms → 秒
-                    dur_ms = img.info.get("duration", 100)
-                    durations.append(dur_ms / 1000.0)
-
-                    self.progress.emit(idx + 1)
+                    self.progress.emit(frames, idx, total_frames, framerate)
                     idx += 1
-
                     try:
                         img.seek(img.tell() + 1)
                     except EOFError:
                         break
+                img = None
+                self.finished.emit(frames)
 
-                # メタデータ fps = 平均値で算出（webp は固定fpsではないため）
-                if len(durations) > 0:
-                    fps = 1.0 / (sum(durations) / len(durations))
-                else:
-                    fps = 15.0
+            elif ext == ".mp4":
+                reader = imageio.get_reader(self.path)
+                total_frames = reader.count_frames()
+                # mp4も固定のフレームレートとして処理する（手抜き）
+                framerate = reader.get_meta_data().get("fps", 15.0)
 
-                self.finished.emit(frames, fps, durations)
-                return
+                for idx, fr in enumerate(reader):
+                    frames.append(fr)
+                    self.progress.emit(frames, idx, total_frames, framerate)
+
+                reader.close()
+                self.finished.emit(frames)
 
             else:
                 self.error.emit("Unsupported format")
 
         except Exception as e:
             self.error.emit(str(e))
+
+    def stop(self):
+        self._is_running = False
 
 # -------------------------------
 # メインウインドウ
@@ -108,11 +99,15 @@ class MainWindow(QMainWindow):
         # 状態管理
         self.playlist = []
         self.current_index = -1
+        self.loader = None
         self.frames = []
         self.durations = []
         self.fps = 0.0
         self.current_frame = 0
+        self.total_frame = 0
+        self.loaded_frame = 0
         self.playing = False
+        self.dummyimage = None
 
         self.pydir = os.path.dirname(os.path.abspath(__file__))
         self.soundOK = DEF_SOUND_OK
@@ -187,11 +182,19 @@ class MainWindow(QMainWindow):
     # --------------------------------
     # ロード
     def load_current(self):
-        if self.current_index < 0 or self.current_index >= len(self.playlist):
-            return
-
         path = self.playlist[self.current_index]
         self.setWindowTitle(path)
+        self.current_frame = 0
+        self.total_frame = 0
+        self.loaded_frame = 0
+
+        if self.loader != None:
+            self.loader.stop()
+            self.loader.wait()
+        self.loader = None
+        self.frames = None
+        gc.collect()
+        self.frames = []
 
         self.loader = FrameLoader(path)
         self.loader.progress.connect(self.on_loading)
@@ -200,23 +203,34 @@ class MainWindow(QMainWindow):
         self.loader.start()
 
     # フレーム単位完了通知
-    def on_loading(self, count):
-        self.info_label.setText(f"Loading... {count} frames")
+    def on_loading(self, frames, count, total, fps):
+        self.frames = frames
+        self.loaded_frame = count + 1
+        self.total_frame = total
+        self.fps = fps
+        self.waittime = int(1000.0 / fps)
+        if count == 0:
+            self.playing = False
+            self.timer.stop()
+            fr = self.frames[0]
+            h, w, _ = fr.shape
+            qimg =  QImage(w, h, QImage.Format_RGB888)
+            color = QColor(128, 128, 128)
+            qimg.fill(color)
+            qimg = self.draw_text_on_image_center(qimg, "not loaded", 32)
+            self.dummyimage = qimg
+
+        self.update_frame()
+        self.update()
 
     # エラー通知
     def on_error(self, msg):
         self.info_label.setText("Error: " + msg)
 
     # 完了通知
-    def on_loaded(self, frames, fps, durations):
+    def on_loaded(self, frames):
         self.frames = frames
-        self.fps = fps
-        self.durations = durations
-        self.current_frame = 0
-        self.playing = False
-        self.timer.stop()
         self.update_frame()
-        self.info_label.setText(f"FPS: {fps:.2f}   Frames: {len(frames)}")
 
     # --------------------------------
     # 表示更新
@@ -225,23 +239,32 @@ class MainWindow(QMainWindow):
         if not self.frames:
             return
 
-        fr = self.frames[self.current_frame]
-        h, w, _ = fr.shape
-        qimg = QImage(fr.data, w, h, 3 * w, QImage.Format_RGB888)
+        if self.current_frame < self.loaded_frame:
+            fr = self.frames[self.current_frame]
+            h, w, _ = fr.shape
+            qimg = QImage(fr.data, w, h, 3 * w, QImage.Format_RGB888)
+        else:
+            # まだ読み込みが完了していないフレームはダミー表示
+            qimg = self.dummyimage
         pix = QPixmap.fromImage(qimg)
         scaled = pix.scaled(self.label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.label.setPixmap(scaled)
-        self.info_label.setText(f"File : {self.current_index + 1} / {len(self.playlist)}, Frame: {self.current_frame + 1} / {len(self.frames)}")
 
+        txtlen = len(str(self.total_frame))
+        fileinfo = f"File:{(self.current_index + 1):>{len(str(len(self.playlist)))}}/{len(self.playlist)}"
+        frameinfo = f"Frame:{(self.current_frame + 1):>{txtlen}}/{self.total_frame}"
+        loadinfo = f"Loaded."
+        if (self.loaded_frame != self.total_frame):
+            loadinfo = f"Load:{self.loaded_frame:>{txtlen}}/{self.total_frame}"
+        self.info_label.setText(f"{fileinfo}, {frameinfo}, {loadinfo}")
+
+    # 再生処理
     def next_frame(self):
         if not self.frames:
             return
-        self.current_frame = (self.current_frame + 1) % len(self.frames)
+        self.current_frame = (self.current_frame + 1) % self.total_frame
         self.update_frame()
-
-        # 次のフレームまでの duration を使用（webp対応）
-        dur = self.durations[self.current_frame] * 1000
-        self.timer.start(int(dur))
+        self.timer.start(int(self.waittime))
 
     # --------------------------------
     # イベント処理
@@ -320,8 +343,7 @@ class MainWindow(QMainWindow):
             return
         self.playing = not self.playing
         if self.playing:
-            dur = self.durations[self.current_frame] * 1000
-            self.timer.start(int(dur))
+            self.timer.start(int(self.waittime))
         else:
             self.timer.stop()
     # 停止
@@ -336,9 +358,9 @@ class MainWindow(QMainWindow):
         if not self.frames:
             return
         self.stop_play()
-        if self.current_frame == (len(self.frames) - 1):
+        if self.current_frame == (self.total_frame - 1):
             return
-        self.current_frame = (self.current_frame + 1) % len(self.frames)
+        self.current_frame = (self.current_frame + 1) % self.total_frame
         self.update_frame()
     # 前のフレーム
     def prev_frame(self):
@@ -347,7 +369,7 @@ class MainWindow(QMainWindow):
         self.stop_play()
         if self.current_frame == 0:
             return
-        self.current_frame = (self.current_frame - 1) % len(self.frames)
+        self.current_frame = (self.current_frame - 1) % self.total_frame
         self.update_frame()
 
     # 次の動画
@@ -375,20 +397,48 @@ class MainWindow(QMainWindow):
         file_path = f"{self.pydir}/{file_name}"
         pvsubfunc.play_wave(file_path)
 
+    # ダミー画像用テキスト描画
+    def draw_text_on_image_center(self, image: QImage, text: str, font_size: int) -> QImage:
+        if image.isNull():
+            return image
+
+        painter = QPainter(image)
+        font = QFont("Arial", font_size, QFont.Bold)
+        painter.setFont(font)
+        painter.setPen(QColor(255, 255, 255))
+        metrics = QFontMetrics(font)
+        text_width = metrics.horizontalAdvance(text)
+        text_height = metrics.height()
+        text_descent = metrics.descent()
+        image_width = image.width()
+        image_height = image.height()
+        x = (image_width - text_width) // 2
+        y = (image_height + text_height) // 2 - text_descent
+        painter.drawText(x, y, text)
+        painter.end()
+        return image
+
     # --------------------------------
     # 保存
     # --------------------------------
     def save_frame(self):
         if not self.frames:
             return
-        fullfname = "no file"
+
+        srcfname = self.playlist[self.current_index]
+        path = os.path.dirname(srcfname)
+        base = os.path.splitext(os.path.basename(srcfname))[0]
+        # シーク動作にあわせてframe番号を1オリジンに変更
+        fname = f"{base}_frm{self.current_frame + 1:04d}.png"
+        fullfname = os.path.join(path, fname)
+
+        if self.current_frame >= self.loaded_frame:
+            #まだロード出来ていないフレームの保存は失敗扱い
+            self.play_wave(self.soundNG)
+            self.info_label.setText(f"not loaded frame: {fullfname}")
+            return
+
         try:
-            srcfname = self.playlist[self.current_index]
-            path = os.path.dirname(srcfname)
-            base = os.path.splitext(os.path.basename(srcfname))[0]
-            # シーク動作にあわせてframe番号を1オリジンに変更
-            fname = f"{base}_frm{self.current_frame + 1:04d}.png"
-            fullfname = os.path.join(path, fname)
             fr = self.frames[self.current_frame]
             img = Image.fromarray(fr)
             img.save(fullfname)

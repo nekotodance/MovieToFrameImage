@@ -1,8 +1,10 @@
 MovieToFrameImage.lnk
 MovieToFrameImage.json
 venv/
+.venv/
 temp/
 old/
+.vscode/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
