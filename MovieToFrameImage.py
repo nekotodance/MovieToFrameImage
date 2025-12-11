@@ -6,23 +6,43 @@ from PIL import Image
 from PyQt5 import QtGui, QtCore, QtWidgets
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap, QColor, QPainter, QFont, QFontMetrics
-from PyQt5.QtWidgets import QLabel, QMainWindow, QApplication, QSizePolicy
+from PyQt5.QtWidgets import (
+    QLabel, QMainWindow, QApplication, QSizePolicy,
+    QWidget, QStatusBar, QVBoxLayout, QHBoxLayout
+)
 
+import shutil
 import pvsubfunc
 
-DEF_SOUND_OK = "ok.wav"
-DEF_SOUND_NG = "ng.wav"
+DEF_SOUND_BEEP = "PromptViewer_beep.wav"
+DEF_SOUND_FCOPY_OK = "PromptViewer_filecopyok.wav"
+DEF_SOUND_F_CANSEL = "PromptViewer_filecansel.wav"
+DEF_SOUND_MOVE_TOP = "PromptViewer_movetop.wav"
+DEF_SOUND_MOVE_END = "PromptViewer_moveend.wav"
 APP_WIDTH = 320
 APP_HEIGHT = 320
+APP_BGCOLOR = QColor(32, 32, 32)
 
-WINDOW_TITLE = "MovieToFrameImage 0.1.2"
+# ファイルコピー先のディレクトリ
+DEF_IMAGE_FCOPY_DIR = "W:/_temp/ai"
+# 最大フレーム数（これを超えるとエラー扱い）
+DEF_MAX_FRAME = 5000
+
+# アプリ名称
+WINDOW_TITLE = "MovieToFrameImage 0.2.0"
+# 設定ファイル
 SETTINGS_FILE = "MovieToFrameImage.json"
+# 設定ファイルのキー名
 GEOMETRY_X = "geometry-x"
 GEOMETRY_Y = "geometry-y"
 GEOMETRY_W = "geometry-w"
 GEOMETRY_H = "geometry-h"
-SOUND_FILE_OK = "sound-file-ok"
-SOUND_FILE_NG = "sound-file-ng"
+SOUND_BEEP = "sound-beep"
+SOUND_FCOPY_OK = "sound-fcopy-ok"
+SOUND_F_CANSEL = "sound-f-cansel"
+SOUND_MOVE_TOP = "sound-move-top"
+SOUND_MOVE_END = "sound-move-end"
+IMAGE_FCOPY_DIR = "image-fcopy-dir"
 
 # -------------------------------
 # フレーム読み込みスレッド
@@ -30,7 +50,7 @@ SOUND_FILE_NG = "sound-file-ng"
 class FrameLoader(QThread):
     progress = pyqtSignal(list, int, int, float)    # frames, 現在フレーム数, 総フレーム数, fps
     finished = pyqtSignal(list)                     # frames
-    error = pyqtSignal(str)
+    error = pyqtSignal(str, int, int)                    # error msg, type, val
 
     def __init__(self, path):
         super().__init__()
@@ -47,6 +67,10 @@ class FrameLoader(QThread):
             if ext == ".webp":
                 img = Image.open(self.path)
                 total_frames = img.n_frames
+                if total_frames > DEF_MAX_FRAME:
+                    self.error.emit("Too many frames", 2, total_frames)
+                    return
+
                 # 本来webpはフレームごとのウェイト（可変フレームレート）に対応しているが、
                 # このソフトでは固定フレームレート（先頭フレームの表示時間から算出）として処理する（手抜き）
                 dur_ms = img.info.get("duration", 66)
@@ -66,6 +90,9 @@ class FrameLoader(QThread):
             elif ext == ".mp4":
                 reader = imageio.get_reader(self.path)
                 total_frames = reader.count_frames()
+                if total_frames > DEF_MAX_FRAME:
+                    self.error.emit("Too many frames", 2, total_frames)
+                    return
                 # mp4も固定のフレームレートとして処理する（手抜き）
                 framerate = reader.get_meta_data().get("fps", 15.0)
 
@@ -77,10 +104,10 @@ class FrameLoader(QThread):
                 self.finished.emit(frames)
 
             else:
-                self.error.emit("Unsupported format")
+                self.error.emit("Unsupported format", 1, 0)
 
         except Exception as e:
-            self.error.emit(str(e))
+            self.error.emit(str(e), 0, 0)
 
     def stop(self):
         self._is_running = False
@@ -94,6 +121,7 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle(WINDOW_TITLE)
         self.setGeometry(100, 100, APP_WIDTH, APP_HEIGHT)
+        self.setStyleSheet(f"background-color: {APP_BGCOLOR.name()};")
         self.setAcceptDrops(True)
 
         # 状態管理
@@ -103,15 +131,24 @@ class MainWindow(QMainWindow):
         self.frames = []
         self.durations = []
         self.fps = 0.0
+        self.current_filename = ""
         self.current_frame = 0
         self.total_frame = 0
         self.loaded_frame = 0
+        self.waittime = int(1000.0 / 15)
+        self.waitplay = self.waittime
         self.playing = False
+        self.playmode = 1      # 0:stop, 1:1x, 2:2x, 3:4x, 4:8x
         self.dummyimage = None
 
         self.pydir = os.path.dirname(os.path.abspath(__file__))
-        self.soundOK = DEF_SOUND_OK
-        self.soundNG = DEF_SOUND_NG
+        self.soundBeep = DEF_SOUND_BEEP
+        self.soundFileCopyOK = DEF_SOUND_FCOPY_OK
+        self.soundFileCansel = DEF_SOUND_F_CANSEL
+        self.soundMoveTop = DEF_SOUND_MOVE_TOP
+        self.soundMoveEnd = DEF_SOUND_MOVE_END
+        self.imageFileCopyDir = ""
+
         #設定ファイルがあれば読み込み
         if os.path.exists(SETTINGS_FILE):
             self.load_settings()
@@ -121,22 +158,23 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self.next_frame)
 
         # UI
+        self.centralWidget = QWidget()
+        self.setCentralWidget(self.centralWidget)
+        self.layout = QVBoxLayout(self.centralWidget)
+        self.layout.setSpacing(0)
+        self.layout.setContentsMargins(0, 0, 0, 0)
+
         self.label = QLabel()
         self.label.setAlignment(Qt.AlignCenter)
         self.label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.label.setMinimumSize(APP_WIDTH, APP_HEIGHT)
 
-        self.info_label = QLabel("動画ファイルかディレクトリをドロップしてください")
-        self.info_label.setAlignment(Qt.AlignLeft)
-        self.info_label.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+        self.layout.addWidget(self.label)
 
-        layout = QtWidgets.QVBoxLayout()
-        layout.addWidget(self.label, stretch=1)
-        layout.addWidget(self.info_label)
-
-        widget = QtWidgets.QWidget()
-        widget.setLayout(layout)
-        self.setCentralWidget(widget)
+        self.statusBar = QStatusBar()
+        self.statusBar.setStyleSheet("color: white; font-size: 14px; background-color: #31363b;")
+        self.setStatusBar(self.statusBar)
+        self.showStatusMes("動画ファイルかディレクトリをドロップしてください")
 
     # --------------------------------
     # Drag & Drop
@@ -151,27 +189,40 @@ class MainWindow(QMainWindow):
         urls = e.mimeData().urls()
         paths = [u.toLocalFile() for u in urls]
 
+        target = paths[0]   # 先頭ファイルのみ対象
+        targetpath = target
+        targetfile = ""
+        if os.path.isfile(target):
+            if not os.path.isfile(target) and f.lower().endswith((".mp4", ".webp")):
+                self.showStatusMes(f"not support file [{target}]")
+                self.play_wave(self.soundBeep)
+                return
+            targetpath = os.path.dirname(target)
+            targetfile = os.path.basename(target)
+
         collected = []
-
-        for path in paths:
-            if os.path.isdir(path):
-                # ディレクトリ → 直下の mp4/webp を対象にする
-                for f in os.listdir(path):
-                    full = os.path.join(path, f)
-                    if os.path.isfile(full) and f.lower().endswith((".mp4", ".webp")):
-                        collected.append(full)
-            else:
-                # 単一ファイル
-                if path.lower().endswith((".mp4", ".webp")):
-                    collected.append(path)
-
+        # ディレクトリ → 直下の mp4/webp を対象にする
+        for f in os.listdir(targetpath):
+            full = os.path.join(targetpath, f)
+            if os.path.isfile(full) and f.lower().endswith((".mp4", ".webp")):
+                collected.append(full)
         # 対象がない
         if not collected:
+            self.showStatusMes(f"not exist support file [{targetpath}]")
+            self.play_wave(self.soundBeep)
             return
 
         # playlist を入れ替え
         self.playlist = collected
         self.current_index = 0
+        # fileドロップだった場合にはindexをファイルまで進める
+        if targetfile != "":
+            for file in self.playlist:
+                if os.path.basename(file) == targetfile:
+                    break
+                self.current_index = self.current_index + 1
+        if self.current_index >= len(self.playlist):
+            self.current_index = 0  # 保険処理
 
         self.load_current()  # ←必ずロード
         self.raise_()
@@ -182,8 +233,8 @@ class MainWindow(QMainWindow):
     # --------------------------------
     # ロード
     def load_current(self):
-        path = self.playlist[self.current_index]
-        self.setWindowTitle(path)
+        self.current_filename = self.playlist[self.current_index]
+        self.setWindowTitle(f"{os.path.basename(self.current_filename)}")
         self.current_frame = 0
         self.total_frame = 0
         self.loaded_frame = 0
@@ -196,7 +247,7 @@ class MainWindow(QMainWindow):
         gc.collect()
         self.frames = []
 
-        self.loader = FrameLoader(path)
+        self.loader = FrameLoader(self.current_filename)
         self.loader.progress.connect(self.on_loading)
         self.loader.finished.connect(self.on_loaded)
         self.loader.error.connect(self.on_error)
@@ -210,22 +261,29 @@ class MainWindow(QMainWindow):
         self.fps = fps
         self.waittime = int(1000.0 / fps)
         if count == 0:
-            self.playing = False
-            self.timer.stop()
+            self.stop_play()
             fr = self.frames[0]
             h, w, _ = fr.shape
             qimg =  QImage(w, h, QImage.Format_RGB888)
-            color = QColor(128, 128, 128)
+            color = APP_BGCOLOR
             qimg.fill(color)
-            qimg = self.draw_text_on_image_center(qimg, "not loaded", 32)
+            qimg = self.draw_text_on_image_center(qimg, "now loading...", 32)
             self.dummyimage = qimg
 
         self.update_frame()
-        self.update()
+
+        if count == 0:
+            self.start_play()
 
     # エラー通知
-    def on_error(self, msg):
-        self.info_label.setText("Error: " + msg)
+    def on_error(self, msg, errtype, errval):
+        self.showStatusMes(f"Error: {msg}")
+        if errtype == 0:
+            self.show_image_message(f"例外が発生しました", 16)
+        elif errtype == 1:
+            self.show_image_message(f"表示できないファイルです", 16)
+        elif errtype == 2:
+            self.show_image_message(f"フレーム数が多すぎます {errval} / 最大{DEF_MAX_FRAME}まで", 16)
 
     # 完了通知
     def on_loaded(self, frames):
@@ -253,18 +311,35 @@ class MainWindow(QMainWindow):
         txtlen = len(str(self.total_frame))
         fileinfo = f"File:{(self.current_index + 1):>{len(str(len(self.playlist)))}}/{len(self.playlist)}"
         frameinfo = f"Frame:{(self.current_frame + 1):>{txtlen}}/{self.total_frame}"
-        loadinfo = f"Loaded."
+        loadinfo = f"Loaded"
         if (self.loaded_frame != self.total_frame):
             loadinfo = f"Load:{self.loaded_frame:>{txtlen}}/{self.total_frame}"
-        self.info_label.setText(f"{fileinfo}, {frameinfo}, {loadinfo}")
+        speedinfo = f"play {self.get_speed(self.playmode)}x"
+        if self.playing == False:
+            if self.playmode == 0:
+                speedinfo = f"stop"
+            else:
+                speedinfo = f"pause {self.get_speed(self.playmode)}x"
+
+        self.showStatusMes(f"{fileinfo}, {frameinfo}, {loadinfo}, {speedinfo}")
 
     # 再生処理
     def next_frame(self):
-        if not self.frames:
-            return
-        self.current_frame = (self.current_frame + 1) % self.total_frame
-        self.update_frame()
-        self.timer.start(int(self.waittime))
+        self.next_frame_manual(False)
+
+    # ファイルのロード中画面表示
+    # ※小さいwebpの場合ちらついてみえるが、大きいファイルの時はこれがないと固まって見える
+    def show_image_message(self, text, fontsize = 24):
+        h = self.label.size().height()
+        w = self.label.size().width()
+        qimg =  QImage(w, h, QImage.Format_RGB888)
+        color = APP_BGCOLOR
+        qimg.fill(color)
+        qimg = self.draw_text_on_image_center(qimg, text, fontsize)
+        pix = QPixmap.fromImage(qimg)
+        scaled = pix.scaled(self.label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.label.setPixmap(scaled)
+        self.label.repaint()
 
     # --------------------------------
     # イベント処理
@@ -285,36 +360,52 @@ class MainWindow(QMainWindow):
     def keyPressEvent(self, e):
         key = e.key()
 
-        # スペース：再生/停止
+        # スペース：再生速度変更
         if key == Qt.Key_Space:
-            self.toggle_play()
+            self.change_playspeed()
         # 左、A：次のフレーム
-        elif key in (Qt.Key_Left, Qt.Key_A):
+        elif key in {Qt.Key_Left, Qt.Key_A}:
             self.prev_frame()
         # 右、D：前のフレーム
-        elif key in (Qt.Key_Right, Qt.Key_D):
+        elif key in {Qt.Key_Right, Qt.Key_D}:
             self.next_frame_manual()
         # , Q：次の動画
-        elif key in (Qt.Key_Comma, Qt.Key_Q):
+        elif key in {Qt.Key_Comma, Qt.Key_Q}:
             self.prev_movie()
         # . E：前の動画
-        elif key in (Qt.Key_Period, Qt.Key_E):
+        elif key in {Qt.Key_Period, Qt.Key_E}:
             self.next_movie()
         # 上 W：保存
-        elif key in (Qt.Key_Up, Qt.Key_W):
+        elif key in {Qt.Key_Up, Qt.Key_W}:
+            self.stop_play()    # フレーム保存時はpause状態にする
             self.save_frame()
         # F：フィット表示（動画サイズにウインドウを合わせる）
         elif key == Qt.Key_F:
-            self.fit_window()
+            self.fit_window(1.0)
+        elif key == Qt.Key_1:
+            self.fit_window(1.0)
+        elif key == Qt.Key_2:
+            self.fit_window(2.0)
+        elif key == Qt.Key_3:
+            self.fit_window(3.0)
+        elif key == Qt.Key_0:
+            self.fit_window(0.5)
+        # R Return：指定フォルダへコピー
+        elif key in {Qt.Key_R, Qt.Key_Return}:
+            self.copyImageFile(self.current_filename, self.imageFileCopyDir)
+        # ESC / \：終了
+        elif key in {Qt.Key_Escape, Qt.Key_Slash, Qt.Key_Backslash}:
+            self.appexit()
 
     # マウスボタン
     def mousePressEvent(self, e):
         test = e.button()
-        # 左：再生/停止
+        # 左：再生速度変更
         if e.button() == Qt.LeftButton:
-            self.toggle_play()
+            self.change_playspeed()
         # 右：保存
         elif e.button() == Qt.RightButton:
+            self.stop_play()    # フレーム保存時はpause状態にする
             self.save_frame()
         # 戻る：Back
         elif e.button() == Qt.XButton1:
@@ -324,7 +415,7 @@ class MainWindow(QMainWindow):
             self.next_movie()
         # 中：フィット表示（動画サイズにウインドウを合わせる）
         elif e.button() == Qt.MiddleButton:
-            self.fit_window()
+            self.fit_window(1.0)
 
     # マウスホイール
     def wheelEvent(self, e):
@@ -337,15 +428,31 @@ class MainWindow(QMainWindow):
     # --------------------------------
     # 動作機能
     # --------------------------------
-    # 再生／停止
-    def toggle_play(self):
+    # 再生速度変更
+    def change_playspeed(self):
+        # 停止中なら再開のみ
+        if self.playing == False and self.playmode != 0:
+            self.start_play()
+            return
+        self.playmode = (self.playmode + 1) % 5   # 0 to 4
+        if self.playmode == 0:
+            self.stop_play()
+        else:
+            self.start_play()
+        self.update_frame()
+
+    # 再生
+    def start_play(self):
         if not self.frames:
             return
-        self.playing = not self.playing
-        if self.playing:
-            self.timer.start(int(self.waittime))
-        else:
-            self.timer.stop()
+        self.playing = True
+        self.waitplay = self.waittime / self.get_speed(self.playmode)
+        self.timer.start(int(self.waitplay))
+    def get_speed(self, mode):
+        res = 1
+        if mode > 1:
+            res = 2 ** (mode - 1)
+        return res
     # 停止
     def stop_play(self):
         if not self.frames:
@@ -354,42 +461,59 @@ class MainWindow(QMainWindow):
         self.timer.stop()
 
     # 次のフレーム
-    def next_frame_manual(self):
+    def next_frame_manual(self, isManual=True):
         if not self.frames:
             return
-        self.stop_play()
+        if isManual:
+            self.stop_play()
         if self.current_frame == (self.total_frame - 1):
-            return
+            self.play_wave(self.soundMoveTop)
         self.current_frame = (self.current_frame + 1) % self.total_frame
         self.update_frame()
+        if not isManual:
+            self.timer.start(int(self.waitplay))
     # 前のフレーム
     def prev_frame(self):
         if not self.frames:
             return
         self.stop_play()
         if self.current_frame == 0:
-            return
+            self.play_wave(self.soundMoveEnd)
         self.current_frame = (self.current_frame - 1) % self.total_frame
         self.update_frame()
 
     # 次の動画
     def next_movie(self):
-        if self.current_index + 1 < len(self.playlist):
-            self.current_index += 1
-            self.load_current()
+        self.current_index = (self.current_index + 1) % len(self.playlist)
+        self.move_func()
     # 前の動画
     def prev_movie(self):
-        if self.current_index > 0:
-            self.current_index -= 1
-            self.load_current()
+        self.current_index = (self.current_index - 1) % len(self.playlist)
+        self.move_func()
+    # 動画の移動表示
+    def move_func(self):
+        self.statusBar.showMessage("file loading...")
+        self.show_image_message("file loading...")
+        self.load_current()
 
     # フィット表示（実寸サイズにウインドウを合わせる）
-    def fit_window(self):
+    def fit_window(self, mag):
         if self.frames:
             fr = self.frames[self.current_frame]
             h, w, _ = fr.shape
-            self.resize(w, h + 40)
+            w = int(w * mag)
+            h = int(h * mag)
+            #self.resize(w, h)
+            self.resize_window_to_fit_image(w, h)
         self.update_frame()
+    def resize_window_to_fit_image(self, img_w, img_h):
+        # 現在のウインドウフレームと centralWidget の差分（フレーム幅）を取得
+        frame_w = self.width() - self.centralWidget.width()
+        frame_h = self.height() - self.centralWidget.height()
+        # centralWidget に画像サイズをぴったり合わせたフレームサイズを算出
+        new_w = img_w + frame_w
+        new_h = img_h + frame_h
+        self.resize(new_w, new_h)
 
     # サウンド再生
     def play_wave(self, file_name):
@@ -405,7 +529,7 @@ class MainWindow(QMainWindow):
         painter = QPainter(image)
         font = QFont("Arial", font_size, QFont.Bold)
         painter.setFont(font)
-        painter.setPen(QColor(255, 255, 255))
+        painter.setPen(QColor(200, 200, 200))
         metrics = QFontMetrics(font)
         text_width = metrics.horizontalAdvance(text)
         text_height = metrics.height()
@@ -418,6 +542,39 @@ class MainWindow(QMainWindow):
         painter.end()
         return image
 
+    def appexit(self):
+        self.close()
+
+    def showStatusMes(self, mes):
+        self.statusBar.showMessage(f"{mes}")
+
+    # --------------------------------
+    # コピー処理
+    # --------------------------------
+    def copyImageFile(self, srcfile, destdir):
+        # なぜかソースファイルがない
+        if not os.path.exists(srcfile):
+            self.showStatusMes(f"not exist [{srcfile}]")
+            self.play_wave(self.soundBeep)
+            return
+
+        destfile = os.path.join(destdir, os.path.basename(srcfile)).replace("\\", "/")
+        # コピー先から削除
+        if os.path.exists(destfile):
+            os.remove(destfile)
+            self.showStatusMes(f"copy cansel [{destfile}]")
+            self.play_wave(self.soundFileCansel)
+            return
+
+        # コピー処理
+        shutil.copy2(srcfile, destdir)
+        if os.path.exists(destfile):
+            self.showStatusMes(f"copyed [{destfile}]")
+            self.play_wave(self.soundFileCopyOK)
+        else:
+            self.showStatusMes(f"copy error [{destfile}]")
+            self.play_wave(self.soundBeep)
+
     # --------------------------------
     # 保存
     # --------------------------------
@@ -425,7 +582,7 @@ class MainWindow(QMainWindow):
         if not self.frames:
             return
 
-        srcfname = self.playlist[self.current_index]
+        srcfname = self.current_filename
         path = os.path.dirname(srcfname)
         base = os.path.splitext(os.path.basename(srcfname))[0]
         # シーク動作にあわせてframe番号を1オリジンに変更
@@ -434,8 +591,8 @@ class MainWindow(QMainWindow):
 
         if self.current_frame >= self.loaded_frame:
             #まだロード出来ていないフレームの保存は失敗扱い
-            self.play_wave(self.soundNG)
-            self.info_label.setText(f"not loaded frame: {fullfname}")
+            self.play_wave(self.soundBeep)
+            self.showStatusMes(f"not loaded frame: {fullfname}")
             return
 
         try:
@@ -443,11 +600,11 @@ class MainWindow(QMainWindow):
             img = Image.fromarray(fr)
             img.save(fullfname)
 
-            self.play_wave(self.soundOK)
-            self.info_label.setText(f"Saved: {fullfname}")
+            self.play_wave(self.soundFileCopyOK)
+            self.showStatusMes(f"Saved: {fullfname}")
         except Exception as e:
-            self.play_wave(self.soundNG)
-            self.info_label.setText(f"error: {fullfname}")
+            self.play_wave(self.soundBeep)
+            self.showStatusMes(f"error: {fullfname}")
 
     # --------------------------------
     # 設定データ
@@ -460,8 +617,14 @@ class MainWindow(QMainWindow):
         if not any(val is None for val in [geox, geoy, geow, geoh]):
             self.setGeometry(geox, geoy, geow, geoh)
 
-        self.soundOK = pvsubfunc.read_value_from_config(SETTINGS_FILE, SOUND_FILE_OK, DEF_SOUND_OK)
-        self.soundNG = pvsubfunc.read_value_from_config(SETTINGS_FILE, SOUND_FILE_NG, DEF_SOUND_NG)
+        self.soundBeep = pvsubfunc.read_value_from_config(SETTINGS_FILE, SOUND_BEEP, DEF_SOUND_BEEP)
+        self.soundFileCopyOK = pvsubfunc.read_value_from_config(SETTINGS_FILE, SOUND_FCOPY_OK, DEF_SOUND_FCOPY_OK)
+        self.soundFileCansel = pvsubfunc.read_value_from_config(SETTINGS_FILE, SOUND_F_CANSEL, DEF_SOUND_F_CANSEL)
+        self.soundMoveTop = pvsubfunc.read_value_from_config(SETTINGS_FILE, SOUND_MOVE_TOP, DEF_SOUND_MOVE_TOP)
+        self.soundMoveEnd = pvsubfunc.read_value_from_config(SETTINGS_FILE, SOUND_MOVE_END, DEF_SOUND_MOVE_END)
+        self.imageFileCopyDir = pvsubfunc.read_value_from_config(SETTINGS_FILE, IMAGE_FCOPY_DIR)
+        if not self.imageFileCopyDir:
+            pvsubfunc.write_value_to_config(SETTINGS_FILE, IMAGE_FCOPY_DIR, DEF_IMAGE_FCOPY_DIR)
 
     def save_settings(self):
         pvsubfunc.write_value_to_config(SETTINGS_FILE, GEOMETRY_X, self.geometry().x())
@@ -469,8 +632,11 @@ class MainWindow(QMainWindow):
         pvsubfunc.write_value_to_config(SETTINGS_FILE, GEOMETRY_W, self.geometry().width())
         pvsubfunc.write_value_to_config(SETTINGS_FILE, GEOMETRY_H, self.geometry().height())
 
-        pvsubfunc.write_value_to_config(SETTINGS_FILE, SOUND_FILE_OK, self.soundOK)
-        pvsubfunc.write_value_to_config(SETTINGS_FILE, SOUND_FILE_NG, self.soundNG)
+        pvsubfunc.write_value_to_config(SETTINGS_FILE, SOUND_BEEP, self.soundBeep)
+        pvsubfunc.write_value_to_config(SETTINGS_FILE, SOUND_FCOPY_OK, self.soundFileCopyOK)
+        pvsubfunc.write_value_to_config(SETTINGS_FILE, SOUND_F_CANSEL, self.soundFileCansel)
+        pvsubfunc.write_value_to_config(SETTINGS_FILE, SOUND_MOVE_TOP, self.soundMoveTop)
+        pvsubfunc.write_value_to_config(SETTINGS_FILE, SOUND_MOVE_END, self.soundMoveEnd)
 
 # ---------------------------------------------------------
 # 起動
