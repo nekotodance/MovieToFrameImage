@@ -29,7 +29,7 @@ DEF_IMAGE_FCOPY_DIR = "W:/_temp/ai"
 DEF_MAX_FRAME = 5000
 
 # アプリ名称
-WINDOW_TITLE = "MovieToFrameImage 0.2.0"
+WINDOW_TITLE = "MovieToFrameImage 0.2.1"
 # 設定ファイル
 SETTINGS_FILE = "MovieToFrameImage.json"
 # 設定ファイルのキー名
@@ -234,7 +234,8 @@ class MainWindow(QMainWindow):
     # ロード
     def load_current(self):
         self.current_filename = self.playlist[self.current_index]
-        self.setWindowTitle(f"{os.path.basename(self.current_filename)}")
+        fileinfo = f"[{(self.current_index + 1):>{len(str(len(self.playlist)))}}/{len(self.playlist)}]"
+        self.setWindowTitle(f"{fileinfo} {os.path.basename(self.current_filename)}")
         self.current_frame = 0
         self.total_frame = 0
         self.loaded_frame = 0
@@ -593,6 +594,13 @@ class MainWindow(QMainWindow):
             #まだロード出来ていないフレームの保存は失敗扱い
             self.play_wave(self.soundBeep)
             self.showStatusMes(f"not loaded frame: {fullfname}")
+            return
+
+        # 同名のファイルがすでに存在していれば削除のみ実行
+        if os.path.exists(fullfname):
+            os.remove(fullfname)
+            self.showStatusMes(f"Deleted: [{fullfname}]")
+            self.play_wave(self.soundFileCansel)
             return
 
         try:
