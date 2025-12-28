@@ -137,7 +137,7 @@ class MainWindow(QMainWindow):
         self.loaded_frame = 0
         self.waittime = int(1000.0 / 15)
         self.waitplay = self.waittime
-        self.playing = False
+        self.playing = True
         self.playmode = 1      # 0:stop, 1:1x, 2:2x, 3:4x, 4:8x
         self.dummyimage = None
 
@@ -273,7 +273,8 @@ class MainWindow(QMainWindow):
 
         self.update_frame()
 
-        if count == 0:
+        #ファイル移行時は再生モードを引き継ぐ
+        if count == 0 and self.playing and self.playmode != 0:
             self.start_play()
 
     # エラー通知
@@ -310,19 +311,19 @@ class MainWindow(QMainWindow):
         self.label.setPixmap(scaled)
 
         txtlen = len(str(self.total_frame))
-        fileinfo = f"File:{(self.current_index + 1):>{len(str(len(self.playlist)))}}/{len(self.playlist)}"
-        frameinfo = f"Frame:{(self.current_frame + 1):>{txtlen}}/{self.total_frame}"
+        fileinfo = f"{(self.current_index + 1):>{len(str(len(self.playlist)))}}/{len(self.playlist)}"
+        frameinfo = f"{(self.current_frame + 1):>{txtlen}}/{self.total_frame}"
         loadinfo = f"Loaded"
         if (self.loaded_frame != self.total_frame):
             loadinfo = f"Load:{self.loaded_frame:>{txtlen}}/{self.total_frame}"
         speedinfo = f"play {self.get_speed(self.playmode)}x"
-        if self.playing == False:
-            if self.playmode == 0:
-                speedinfo = f"stop"
-            else:
-                speedinfo = f"pause {self.get_speed(self.playmode)}x"
+        if self.playmode == 0:
+            speedinfo = f"stop"
+        elif self.playing == False:
+            speedinfo = f"pause {self.get_speed(self.playmode)}x"
 
-        self.showStatusMes(f"{fileinfo}, {frameinfo}, {loadinfo}, {speedinfo}")
+        self.setWindowTitle(f"[{fileinfo}] ({frameinfo}) {os.path.basename(self.current_filename)}")
+        self.showStatusMes(f"[File:{fileinfo}], (Frame:{frameinfo}), {loadinfo}, {speedinfo}")
 
     # 再生処理
     def next_frame(self):
@@ -361,8 +362,12 @@ class MainWindow(QMainWindow):
     def keyPressEvent(self, e):
         key = e.key()
 
+        # Ctrlキー併用は別で処理する
+        if e.modifiers() & Qt.ControlModifier:
+            if key in {Qt.Key_W}:   # Ctrl+w
+                self.appexit()
         # スペース：再生速度変更
-        if key == Qt.Key_Space:
+        elif key == Qt.Key_Space:
             self.change_playspeed()
         # 左、A：次のフレーム
         elif key in {Qt.Key_Left, Qt.Key_A}:
@@ -378,7 +383,7 @@ class MainWindow(QMainWindow):
             self.next_movie()
         # 上 W：保存
         elif key in {Qt.Key_Up, Qt.Key_W}:
-            self.stop_play()    # フレーム保存時はpause状態にする
+            self.pause_play()    # フレーム保存時はpause状態にする
             self.save_frame()
         # F：フィット表示（動画サイズにウインドウを合わせる）
         elif key == Qt.Key_F:
@@ -406,7 +411,7 @@ class MainWindow(QMainWindow):
             self.change_playspeed()
         # 右：保存
         elif e.button() == Qt.RightButton:
-            self.stop_play()    # フレーム保存時はpause状態にする
+            self.pause_play()    # フレーム保存時はpause状態にする
             self.save_frame()
         # 戻る：Back
         elif e.button() == Qt.XButton1:
@@ -454,19 +459,22 @@ class MainWindow(QMainWindow):
         if mode > 1:
             res = 2 ** (mode - 1)
         return res
-    # 停止
+    # 再生停止
     def stop_play(self):
         if not self.frames:
             return
-        self.playing = False
         self.timer.stop()
+    # 一次停止
+    def pause_play(self):
+        self.playing = False
+        self.stop_play()
 
     # 次のフレーム
     def next_frame_manual(self, isManual=True):
         if not self.frames:
             return
         if isManual:
-            self.stop_play()
+            self.pause_play()
         if self.current_frame == (self.total_frame - 1):
             self.play_wave(self.soundMoveTop)
         self.current_frame = (self.current_frame + 1) % self.total_frame
@@ -477,7 +485,7 @@ class MainWindow(QMainWindow):
     def prev_frame(self):
         if not self.frames:
             return
-        self.stop_play()
+        self.pause_play()
         if self.current_frame == 0:
             self.play_wave(self.soundMoveEnd)
         self.current_frame = (self.current_frame - 1) % self.total_frame
