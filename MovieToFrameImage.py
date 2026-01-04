@@ -29,7 +29,7 @@ DEF_IMAGE_FCOPY_DIR = "W:/_temp/ai"
 DEF_MAX_FRAME = 5000
 
 # アプリ名称
-WINDOW_TITLE = "MovieToFrameImage 0.2.1"
+WINDOW_TITLE = "MovieToFrameImage 0.2.3"
 # 設定ファイル
 SETTINGS_FILE = "MovieToFrameImage.json"
 # 設定ファイルのキー名
