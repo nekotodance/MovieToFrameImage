@@ -29,7 +29,7 @@ DEF_IMAGE_FCOPY_DIR = "W:/_temp/ai"
 DEF_MAX_FRAME = 5000
 
 # アプリ名称
-WINDOW_TITLE = "MovieToFrameImage 0.2.3"
+WINDOW_TITLE = "MovieToFrameImage 0.2.4"
 # 設定ファイル
 SETTINGS_FILE = "MovieToFrameImage.json"
 # 設定ファイルのキー名
@@ -48,9 +48,12 @@ IMAGE_FCOPY_DIR = "image-fcopy-dir"
 # フレーム読み込みスレッド
 # -------------------------------
 class FrameLoader(QThread):
-    progress = pyqtSignal(list, int, int, float)    # frames, 現在フレーム数, 総フレーム数, fps
-    finished = pyqtSignal(list)                     # frames
-    error = pyqtSignal(str, int, int)                    # error msg, type, val
+    # フレーム単位の通知：frames, 現在フレーム数, 総フレーム数, fps, 横, 縦
+    progress = pyqtSignal(list, int, int, float, int, int)
+    # 完了通知：frames
+    finished = pyqtSignal(list)
+    # エラー通知：error msg, type, val
+    error = pyqtSignal(str, int, int)
 
     def __init__(self, path):
         super().__init__()
@@ -63,6 +66,8 @@ class FrameLoader(QThread):
             frames = []
             idx = 0
             framerate = 0.0
+            imgw = 0
+            imgh = 0
 
             if ext == ".webp":
                 img = Image.open(self.path)
@@ -75,10 +80,12 @@ class FrameLoader(QThread):
                 # このソフトでは固定フレームレート（先頭フレームの表示時間から算出）として処理する（手抜き）
                 dur_ms = img.info.get("duration", 66)
                 framerate = 1.0 / (dur_ms / 1000.0)
+                imgw, imgh = img.size
+
                 while self._is_running:
                     frame = np.array(img.convert("RGB"))
                     frames.append(frame)
-                    self.progress.emit(frames, idx, total_frames, framerate)
+                    self.progress.emit(frames, idx, total_frames, framerate, imgw, imgh)
                     idx += 1
                     try:
                         img.seek(img.tell() + 1)
@@ -95,10 +102,13 @@ class FrameLoader(QThread):
                     return
                 # mp4も固定のフレームレートとして処理する（手抜き）
                 framerate = reader.get_meta_data().get("fps", 15.0)
+                # 先頭フレームから画像サイズを取得
+                image = reader.get_data(0)
+                imgw, imgh = image.shape[:2]
 
                 for idx, fr in enumerate(reader):
                     frames.append(fr)
-                    self.progress.emit(frames, idx, total_frames, framerate)
+                    self.progress.emit(frames, idx, total_frames, framerate, imgw, imgh)
 
                 reader.close()
                 self.finished.emit(frames)
@@ -129,6 +139,8 @@ class MainWindow(QMainWindow):
         self.current_index = -1
         self.loader = None
         self.frames = []
+        self.imgwidth = 0
+        self.imgheight = 0
         self.durations = []
         self.fps = 0.0
         self.current_filename = ""
@@ -255,11 +267,13 @@ class MainWindow(QMainWindow):
         self.loader.start()
 
     # フレーム単位完了通知
-    def on_loading(self, frames, count, total, fps):
+    def on_loading(self, frames, count, total, fps, imgw, imgh):
         self.frames = frames
         self.loaded_frame = count + 1
         self.total_frame = total
         self.fps = fps
+        self.imgwidth = imgw
+        self.imgheight = imgh
         self.waittime = int(1000.0 / fps)
         if count == 0:
             self.stop_play()
@@ -322,7 +336,7 @@ class MainWindow(QMainWindow):
         elif self.playing == False:
             speedinfo = f"pause {self.get_speed(self.playmode)}x"
 
-        self.setWindowTitle(f"[{fileinfo}] ({frameinfo}) {os.path.basename(self.current_filename)}")
+        self.setWindowTitle(f"[{fileinfo}] ({frameinfo}) {os.path.basename(self.current_filename)} {self.imgwidth}x{self.imgheight}")
         self.showStatusMes(f"[File:{fileinfo}], (Frame:{frameinfo}), {loadinfo}, {speedinfo}")
 
     # 再生処理
